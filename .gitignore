@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Local outputs
+checkpoints/*
+!checkpoints/.gitkeep
+generated/*
+!generated/.gitkeep
+runs/
+wandb/
+
+# Dataset and caches
+data/*
+!data/.gitkeep
+data/.cache/
+
+# Local documents
+s41551-024-01246-y.pdf
+
+# OS / misc
+.DS_Store
+Thumbs.db
+*.log
