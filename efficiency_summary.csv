@@ -1,0 +1,13 @@
+run,method,image_size,steps,effective_batch,trainable_params_M,total_params_M,trainable_pct,peak_vram_gb,wall_clock_min
+checkpoints_roentgen_smoke,full_ft,128,1,1,982.581,1066.2,92.154,20.15,1.38
+checkpoints_roentgen_smoke_noopt,full_ft,128,1,1,982.581,1066.2,92.154,20.15,0.43
+checkpoints_roentgen_baseline_256_pilot,full_ft,256,5,2,982.581,1066.2,92.154,20.14,0.75
+roentgen_baseline_256_s100,full_ft,256,100,2,982.581,1066.2,92.154,20.14,10.93
+roentgen_baseline_256_s5000,full_ft,256,5000,2,982.581,1066.2,92.154,20.14,336.8
+checkpoints_lora_256,lora_unet_te_r8,256,5000,32,2.184,1068.4,0.204,3.03,118.81
+checkpoints_prg,prg_lam0.5_r8,256,100,8,2.184,1068.4,0.204,3.21,5.02
+checkpoints_prg_256,prg_lam0.5_r8,256,5000,32,2.184,1068.4,0.204,10.27,144.67
+checkpoints_lora_512,lora_unet_te_r8,512,5000,32,2.184,1068.4,0.204,3.97,372.72
+checkpoints_lora,lora_unet_te_r16,256,100,8,4.368,1070.6,0.408,4.0,3.64
+checkpoints_lora_512_rs16,lora_unet_te_r16,512,5000,32,4.368,1070.6,0.408,4.0,435.29
+checkpoints_stlora,stlora_r8,256,100,32,2.746,1069.0,0.257,3.04,3.51

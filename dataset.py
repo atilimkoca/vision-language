@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from transformers import CLIPTokenizer
+from transformers import AutoTokenizer, CLIPTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -31,6 +31,9 @@ MAX_TOKEN_LENGTH = 77
 MIN_IMPRESSION_CHARS = 7
 TOKENIZER_ID = "openai/clip-vit-large-patch14"
 _DEFAULT_WORKERS = 0 if platform.system() == "Windows" else 4
+TRAIN_FOLDERS = tuple(f"p{i}" for i in range(10, 19))
+TEST_FOLDERS = ("p19",)
+VALID_SPLITS = ("train", "test", "all")
 
 
 def _safe_eval_list(value) -> list:
@@ -60,12 +63,31 @@ def _extract_study_id(image_path: str) -> Optional[str]:
     return None
 
 
+def _extract_mimic_folder(image_path: str) -> Optional[str]:
+    """Extract MIMIC top-level folder such as p10 or p19 from an image path."""
+    for part in image_path.replace("\\", "/").split("/"):
+        if re.fullmatch(r"p\d{2}", part):
+            return part
+    return None
+
+
+def _folders_for_split(split: str) -> Optional[tuple]:
+    if split not in VALID_SPLITS:
+        raise ValueError(f"split must be one of {VALID_SPLITS}; got {split!r}.")
+    if split == "train":
+        return TRAIN_FOLDERS
+    if split == "test":
+        return TEST_FOLDERS
+    return None
+
+
 def build_metadata(
     data_root: str,
     csv_path: Optional[str] = None,
     use_augmented: bool = False,
     max_samples: Optional[int] = None,
     sample_seed: int = 42,
+    split: str = "train",
 ) -> pd.DataFrame:
     """
     Build image_path/impression pairs from the preprocessed CSV file.
@@ -76,11 +98,13 @@ def build_metadata(
         use_augmented: include rows from text_augment when available.
         max_samples: optional random subset size for lightweight runs.
         sample_seed: random seed used with max_samples.
+        split: RoentGen-style split: train=p10-p18, test=p19, all=no filter.
     """
+    allowed_folders = _folders_for_split(split)
     data_root_path = Path(data_root)
     csv_file = Path(csv_path) if csv_path else data_root_path / "mimic_cxr_aug_train.csv"
     cache_dir = data_root_path / ".cache"
-    cache_file = cache_dir / f"{csv_file.stem}_pa_metadata_aug{int(use_augmented)}.csv"
+    cache_file = cache_dir / f"{csv_file.stem}_pa_metadata_split-{split}_aug{int(use_augmented)}.csv"
 
     if not csv_file.exists():
         raise FileNotFoundError(f"Training CSV not found: {csv_file}")
@@ -122,6 +146,10 @@ def build_metadata(
                     study_text_aug[study_id] = texts_aug[index]
 
             for pa_image in pa_images:
+                folder = _extract_mimic_folder(pa_image)
+                if allowed_folders is not None and folder not in allowed_folders:
+                    continue
+
                 study_id = _extract_study_id(pa_image)
                 if study_id is None or study_id not in study_text:
                     continue
@@ -152,10 +180,10 @@ def build_metadata(
                         )
 
         metadata = pd.DataFrame(rows)
-        logger.info("PA image/impression matches: %s", len(metadata))
+        logger.info("PA image/impression matches for split=%s: %s", split, len(metadata))
 
         if metadata.empty:
-            raise RuntimeError("No valid PA image/impression pairs were found.")
+            raise RuntimeError(f"No valid PA image/impression pairs were found for split={split}.")
 
         tokenizer = CLIPTokenizer.from_pretrained(TOKENIZER_ID)
         tokenized = tokenizer(
@@ -180,7 +208,7 @@ def build_metadata(
             metadata = metadata.sample(n=max_samples, random_state=sample_seed).reset_index(drop=True)
             logger.info("Using lightweight subset: %s samples", len(metadata))
 
-    logger.info("Final training set size: %s", len(metadata))
+    logger.info("Final metadata size for split=%s: %s", split, len(metadata))
     return metadata
 
 
@@ -192,24 +220,40 @@ class MIMICCXRDataset(Dataset):
         dataframe: pd.DataFrame,
         tokenizer_name: str = TOKENIZER_ID,
         image_size: int = 512,
+        labels=None,
     ):
         if image_size <= 0:
             raise ValueError("image_size must be a positive integer.")
 
         self.df = dataframe.reset_index(drop=True)
         self.image_size = image_size
-        self.tokenizer = CLIPTokenizer.from_pretrained(tokenizer_name)
-        self.input_ids = self.tokenizer(
+        # Opsiyonel CheXpert hedef etiketleri (PRG ödülü için). None ise döndürülmez
+        # → baseline/LoRA hattı etkilenmez.
+        self.labels = None
+        if labels is not None:
+            self.labels = torch.as_tensor(labels, dtype=torch.float32)
+            if len(self.labels) != len(self.df):
+                raise ValueError("labels uzunluğu dataframe ile eşleşmiyor.")
+        # AutoTokenizer hem CLIP hem BERT-tabanlı modelleri destekler
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        tokenized = self.tokenizer(
             self.df["impression"].tolist(),
             padding="max_length",
             max_length=MAX_TOKEN_LENGTH,
             truncation=True,
             return_tensors="pt",
-        )["input_ids"]
+        )
+        self.input_ids = tokenized["input_ids"]
+        self.attention_mask = tokenized["attention_mask"]
+        self.impressions = self.df["impression"].tolist()
 
+        # Makale (Methods): "All CXRs were centre-cropped and resized."
+        # Kareye doğrudan Resize en/boy oranını bozar; önce kısa kenarı ölçekle,
+        # sonra merkezi kare kırp → anatomi korunur.
         self.image_transform = transforms.Compose(
             [
-                transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
             ]
@@ -223,10 +267,15 @@ class MIMICCXRDataset(Dataset):
         with Image.open(row["image_path"]) as image:
             pixel_values = self.image_transform(image.convert("RGB"))
 
-        return {
+        item = {
             "pixel_values": pixel_values,
             "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_mask[idx],
+            "impression": self.impressions[idx],
         }
+        if self.labels is not None:
+            item["labels"] = self.labels[idx]
+        return item
 
 
 def create_dataloader(
@@ -238,16 +287,33 @@ def create_dataloader(
     image_size: int = 512,
     max_samples: Optional[int] = None,
     sample_seed: int = 42,
+    tokenizer_name: str = TOKENIZER_ID,
+    chexpert_csv: Optional[str] = None,
+    split: str = "train",
 ) -> DataLoader:
-    """Build the end-to-end DataLoader used by train.py."""
+    """Build the end-to-end DataLoader used by train.py.
+
+    chexpert_csv verilirse (PRG için) her örneğe CheXpert hedef etiket vektörü
+    eklenir; verilmezse davranış değişmez (baseline/LoRA).
+    """
     dataframe = build_metadata(
         data_root=data_root,
         csv_path=csv_path,
         use_augmented=use_augmented,
         max_samples=max_samples,
         sample_seed=sample_seed,
+        split=split,
     )
-    dataset = MIMICCXRDataset(dataframe, image_size=image_size)
+
+    labels = None
+    if chexpert_csv is not None:
+        from pathology_reward import load_chexpert_labels, labels_for_image_paths
+        chex = load_chexpert_labels(chexpert_csv)
+        labels = labels_for_image_paths(dataframe["image_path"].tolist(), chex)
+
+    dataset = MIMICCXRDataset(
+        dataframe, tokenizer_name=tokenizer_name, image_size=image_size, labels=labels,
+    )
 
     loader_kwargs = {
         "dataset": dataset,
@@ -279,6 +345,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=_DEFAULT_WORKERS)
+    parser.add_argument("--split", choices=VALID_SPLITS, default="train")
     args = parser.parse_args()
 
     loader = create_dataloader(
@@ -289,6 +356,7 @@ if __name__ == "__main__":
         use_augmented=args.use_augmented,
         image_size=args.image_size,
         max_samples=args.max_samples,
+        split=args.split,
     )
 
     batch = next(iter(loader))

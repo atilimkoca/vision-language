@@ -20,7 +20,10 @@ import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
 
+import time
+
 from dataset import create_dataloader
+from run_logging import LossLogger, log_efficiency, reset_peak_vram, count_params
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -38,10 +41,15 @@ _DEFAULT_WORKERS = 0 if platform.system() == "Windows" else 4
 
 def setup_model(
     device: torch.device,
-    dtype: torch.dtype,
     use_gradient_checkpointing: bool = True,
 ):
-    """Load Stable Diffusion components and move them to the target device."""
+    """Load Stable Diffusion components and move them to the target device.
+
+    Master weights are kept in fp32. Mixed precision (bf16) is applied only at
+    compute time via autocast in the training loop — casting the trainable
+    weights themselves to bf16 would also force the AdamW optimizer states to
+    bf16 and degrade update precision / stability.
+    """
     logger.info("Loading model: %s", MODEL_ID)
 
     tokenizer = CLIPTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
@@ -63,9 +71,10 @@ def setup_model(
     unet.train()
     text_encoder.train()
 
-    vae.to(device, dtype=dtype)
-    unet.to(device, dtype=dtype)
-    text_encoder.to(device, dtype=dtype)
+    # fp32 master weights — bf16 only via autocast at compute time.
+    vae.to(device)
+    unet.to(device)
+    text_encoder.to(device)
 
     return vae, unet, text_encoder, tokenizer, noise_scheduler
 
@@ -83,11 +92,12 @@ def train(
     resume_step: int = 0,
     csv_path: str = None,
     use_augmented: bool = False,
-    freeze_text_encoder: bool = True,
+    freeze_text_encoder: bool = False,
     image_size: int = 512,
     max_samples: int = None,
     demo_mode: bool = False,
     use_gradient_checkpointing: bool = True,
+    save_optimizer: bool = False,
 ):
     """Run training."""
     os.makedirs(output_dir, exist_ok=True)
@@ -114,7 +124,6 @@ def train(
 
     vae, unet, text_encoder, tokenizer, noise_scheduler = setup_model(
         device=device,
-        dtype=dtype,
         use_gradient_checkpointing=use_gradient_checkpointing,
     )
 
@@ -131,6 +140,7 @@ def train(
         use_augmented=use_augmented,
         image_size=image_size,
         max_samples=max_samples,
+        split="train",
     )
     if len(train_loader) == 0:
         raise RuntimeError("DataLoader produced zero batches. Lower batch size or increase max_samples.")
@@ -153,8 +163,14 @@ def train(
     global_step = resume_step
     accum_loss = 0.0
     micro_step = 0
+    last_saved_step = None
     optimizer.zero_grad(set_to_none=True)
     use_autocast = device.type == "cuda" and dtype != torch.float32
+
+    # Loss CSV + verimlilik takibi (rapor için)
+    loss_csv = LossLogger(os.path.join(output_dir, "metrics.csv"))
+    reset_peak_vram()
+    start_time = time.time()
 
     logger.info("Training starts: global_step=%s target=%s", global_step, max_train_steps)
 
@@ -165,18 +181,13 @@ def train(
                 done = True
                 break
 
-            pixel_values = batch["pixel_values"].to(device, dtype=dtype, non_blocking=True)
+            # fp32 master weights: feed fp32 to the frozen VAE; bf16 only inside autocast.
+            pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
 
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
-
-            if freeze_text_encoder:
-                with torch.no_grad():
-                    encoder_hidden_states = text_encoder(input_ids)[0]
-            else:
-                encoder_hidden_states = text_encoder(input_ids)[0]
 
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
@@ -193,13 +204,16 @@ def train(
                 else contextlib.nullcontext()
             )
             with autocast_context:
+                if freeze_text_encoder:
+                    with torch.no_grad():
+                        encoder_hidden_states = text_encoder(input_ids)[0]
+                else:
+                    encoder_hidden_states = text_encoder(input_ids)[0]
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
             loss = F.mse_loss(noise_pred.float(), noise.float())
-            loss = loss / gradient_accumulation_steps
-            loss.backward()
-
             accum_loss += loss.item()
+            (loss / gradient_accumulation_steps).backward()
             micro_step += 1
 
             if micro_step % gradient_accumulation_steps == 0:
@@ -210,20 +224,33 @@ def train(
 
                 avg_loss = accum_loss / gradient_accumulation_steps
                 logger.info("Step %s/%s loss=%.6f", global_step, max_train_steps, avg_loss)
+                loss_csv.log(global_step, round(avg_loss, 6))
                 accum_loss = 0.0
 
                 if global_step % save_every == 0:
-                    _save_checkpoint(unet, text_encoder, tokenizer, vae, optimizer, global_step, output_dir)
+                    _save_checkpoint(
+                        unet, text_encoder, tokenizer, vae, optimizer, global_step, output_dir, save_optimizer
+                    )
+                    last_saved_step = global_step
 
                 if global_step >= max_train_steps:
                     done = True
                     break
 
-    _save_checkpoint(unet, text_encoder, tokenizer, vae, optimizer, global_step, output_dir)
+    if last_saved_step != global_step:
+        _save_checkpoint(unet, text_encoder, tokenizer, vae, optimizer, global_step, output_dir, save_optimizer)
+    loss_csv.close()
+    trainable, total = count_params(unet, text_encoder, vae)
+    rec = log_efficiency(
+        output_dir=output_dir, method="full_ft", image_size=image_size,
+        steps=global_step, effective_batch=effective_batch_size,
+        trainable=trainable, total=total, start_time=start_time,
+    )
+    logger.info("Verimlilik: %s", rec)
     logger.info("Training finished after %s optimizer steps", global_step)
 
 
-def _save_checkpoint(unet, text_encoder, tokenizer, vae, optimizer, step, output_dir):
+def _save_checkpoint(unet, text_encoder, tokenizer, vae, optimizer, step, output_dir, save_optimizer=False):
     """Save a checkpoint in diffusers component format."""
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -232,7 +259,8 @@ def _save_checkpoint(unet, text_encoder, tokenizer, vae, optimizer, step, output
     text_encoder.save_pretrained(os.path.join(ckpt_dir, "text_encoder"))
     tokenizer.save_pretrained(os.path.join(ckpt_dir, "tokenizer"))
     vae.save_pretrained(os.path.join(ckpt_dir, "vae"))
-    torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+    if save_optimizer:
+        torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
 
     logger.info("Checkpoint saved: %s", ckpt_dir)
 
@@ -253,11 +281,17 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=_DEFAULT_WORKERS)
     parser.add_argument("--save_every", type=int, default=5000)
     parser.add_argument("--resume_step", type=int, default=0)
-    parser.add_argument("--no_freeze_text_encoder", action="store_true")
+    # RoentGen'in en iyi modeli (FID 3.6) U-Net + CLIP text encoder'ı BİRLİKTE
+    # eğitir (joint fine-tuning). Varsayılan budur; donuk text encoder için flag.
+    parser.add_argument("--freeze_text_encoder", action="store_true",
+                        help="Text encoder'ı dondur (SD U-Net only; makalede FID 9.2). "
+                             "Varsayılan: joint fine-tuning (U-Net + CLIP).")
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--demo_mode", action="store_true")
     parser.add_argument("--no_gradient_checkpointing", action="store_true")
+    parser.add_argument("--save_optimizer", action="store_true",
+                        help="Also save AdamW optimizer state. Large; not needed for inference/evaluation.")
 
     return parser.parse_args()
 
@@ -277,9 +311,10 @@ if __name__ == "__main__":
         resume_step=args.resume_step,
         csv_path=args.csv_path,
         use_augmented=args.use_augmented,
-        freeze_text_encoder=not args.no_freeze_text_encoder,
+        freeze_text_encoder=args.freeze_text_encoder,
         image_size=args.image_size,
         max_samples=args.max_samples,
         demo_mode=args.demo_mode,
         use_gradient_checkpointing=not args.no_gradient_checkpointing,
+        save_optimizer=args.save_optimizer,
     )

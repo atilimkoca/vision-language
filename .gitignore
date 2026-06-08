@@ -9,26 +9,53 @@ __pycache__/
 .venv/
 venv/
 env/
+.conda/
+conda/
 
 # IDE
 .vscode/
 .idea/
+.claude/
 
-# Local outputs
+# Model checkpoints and weights
 checkpoints/*
 !checkpoints/.gitkeep
+checkpoints_*/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+*.pkl
+*.npy
+*.npz
+
+# Local outputs
 generated/*
 !generated/.gitkeep
 runs/
 wandb/
+eval_results/
 
 # Dataset and caches
 data/*
 !data/.gitkeep
 data/.cache/
 
-# Local documents
+# Local documents and reference checkouts
 s41551-024-01246-y.pdf
+s41551-024-01246-y.md
+RoentGen-main/
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.pdf
+paper/*.toc
+paper/*.synctex.gz
+paper/compile_log.txt
 
 # OS / misc
 .DS_Store

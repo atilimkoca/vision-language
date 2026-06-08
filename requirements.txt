@@ -27,3 +27,18 @@ tokenizers==0.13.2
 # --- Görüntü işleme & yardımcı ---
 Pillow==9.2.0
 ftfy==6.1.1
+
+# --- Katki ve degerlendirme ekleri ---
+# LoRA / PRG egitimi
+peft
+torchxrayvision
+
+# RoentGen tarzi metrikler
+clean-fid
+pytorch-msssim
+nltk
+rouge-score
+bert-score
+
+# Opsiyonel: gercek F1CheXbert icin ortama gore ayrica kurulabilir.
+# f1chexbert

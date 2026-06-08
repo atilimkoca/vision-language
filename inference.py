@@ -3,12 +3,10 @@ RoentGen – Çıkarım (Inference) Scripti
 ========================================
 Eğitilmiş fine-tuned modelden sentetik göğüs röntgeni üretimi.
 
-Blueprint §6 kuralları:
-  • Scheduler:  PNDMScheduler
-  • Inference steps: 75
-  • CFG scale: 4.0
-  • Çıktı çözünürlüğü: 512×512
-  • Safety checker: devre dışı
+Scheduler seçenekleri:
+  • pndm  : Blueprint §6 (varsayılan, 75 adım)
+  • ddim  : 20 adımda makaleye yakın kalite — ~3.75x hızlı
+  • dpm   : DPM-Solver++ 20 adımda en iyi kalite/hız dengesi
 """
 
 import os
@@ -19,6 +17,8 @@ from typing import List, Optional
 import torch
 from diffusers import (
     AutoencoderKL,
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
     PNDMScheduler,
     StableDiffusionPipeline,
     UNet2DConditionModel,
@@ -34,11 +34,18 @@ GUIDANCE_SCALE = 4.0
 IMAGE_SIZE = 512
 BASE_MODEL_ID = "CompVis/stable-diffusion-v1-4"
 
+SCHEDULER_MAP = {
+    "pndm": PNDMScheduler,
+    "ddim": DDIMScheduler,
+    "dpm":  DPMSolverMultistepScheduler,
+}
+
 
 def load_pipeline(
     checkpoint_dir: str,
     device: str = "cuda",
     dtype: torch.dtype = torch.float16,
+    scheduler_name: str = "pndm",
 ) -> StableDiffusionPipeline:
     """
     Eğitilmiş checkpoint'ten StableDiffusionPipeline oluşturur.
@@ -51,9 +58,10 @@ def load_pipeline(
         └── vae/
 
     Args:
-        checkpoint_dir: train.py'nin kaydettiği checkpoint klasörü yolu.
-        device:         "cuda" veya "cpu".
-        dtype:          torch.float16 veya torch.bfloat16.
+        checkpoint_dir:  train.py'nin kaydettiği checkpoint klasörü yolu.
+        device:          "cuda" veya "cpu".
+        dtype:           torch.float16 veya torch.bfloat16.
+        scheduler_name:  "pndm" | "ddim" | "dpm"
 
     Returns:
         Kullanıma hazır StableDiffusionPipeline.
@@ -66,8 +74,10 @@ def load_pipeline(
     tokenizer = CLIPTokenizer.from_pretrained(os.path.join(checkpoint_dir, "tokenizer"))
     vae = AutoencoderKL.from_pretrained(os.path.join(checkpoint_dir, "vae"))
 
-    # PNDMScheduler (blueprint §6)
-    scheduler = PNDMScheduler.from_pretrained(BASE_MODEL_ID, subfolder="scheduler")
+    # Scheduler seç
+    scheduler_cls = SCHEDULER_MAP.get(scheduler_name, PNDMScheduler)
+    scheduler = scheduler_cls.from_pretrained(BASE_MODEL_ID, subfolder="scheduler")
+    logger.info("Scheduler: %s", scheduler_cls.__name__)
 
     # Pipeline oluştur — safety_checker devre dışı (blueprint §4)
     pipeline = StableDiffusionPipeline(
@@ -90,6 +100,7 @@ def generate(
     prompt: str,
     num_images: int = 1,
     seed: Optional[int] = None,
+    num_steps: int = NUM_INFERENCE_STEPS,
 ) -> list:
     """
     Verilen metin prompt'undan sentetik göğüs röntgeni üretir.
@@ -110,7 +121,7 @@ def generate(
     result = pipeline(
         prompt=prompt,
         num_images_per_prompt=num_images,
-        num_inference_steps=NUM_INFERENCE_STEPS,
+        num_inference_steps=num_steps,
         guidance_scale=GUIDANCE_SCALE,
         height=IMAGE_SIZE,
         width=IMAGE_SIZE,
@@ -126,6 +137,7 @@ def generate_and_save(
     output_dir: str = "./generated",
     num_images: int = 1,
     seed: Optional[int] = None,
+    num_steps: int = NUM_INFERENCE_STEPS,
 ) -> List[str]:
     """
     Görüntü üretir ve diske PNG olarak kaydeder.
@@ -134,7 +146,7 @@ def generate_and_save(
         Kaydedilen dosya yollarının listesi.
     """
     os.makedirs(output_dir, exist_ok=True)
-    images = generate(pipeline, prompt, num_images=num_images, seed=seed)
+    images = generate(pipeline, prompt, num_images=num_images, seed=seed, num_steps=num_steps)
 
     saved_paths = []
     for i, img in enumerate(images):
@@ -169,6 +181,11 @@ def parse_args():
                         help="Rastgele tohum (tekrarlanabilirlik)")
     parser.add_argument("--device", type=str, default="cuda",
                         choices=["cuda", "cpu"])
+    parser.add_argument("--scheduler", type=str, default="pndm",
+                        choices=["pndm", "ddim", "dpm"],
+                        help="Scheduler: pndm (makale, 75 adım) | ddim | dpm (20 adımda iyi kalite)")
+    parser.add_argument("--num_steps", type=int, default=None,
+                        help="Inference adım sayısı (varsayılan: pndm=75, ddim/dpm=20)")
     parser.add_argument("--bf16", action="store_true",
                         help="bfloat16 kullan (varsayılan: float16)")
 
@@ -180,11 +197,22 @@ if __name__ == "__main__":
 
     dtype = torch.bfloat16 if args.bf16 else torch.float16
 
+    # Adım sayısı: belirtilmemişse scheduler'a göre otomatik
+    if args.num_steps is not None:
+        num_steps = args.num_steps
+    elif args.scheduler in ("ddim", "dpm"):
+        num_steps = 20
+    else:
+        num_steps = NUM_INFERENCE_STEPS
+
+    logger.info("Scheduler: %s | Steps: %d | CFG: %.1f", args.scheduler, num_steps, GUIDANCE_SCALE)
+
     # Pipeline yükle
     pipe = load_pipeline(
         checkpoint_dir=args.checkpoint_dir,
         device=args.device,
         dtype=dtype,
+        scheduler_name=args.scheduler,
     )
 
     # Görüntü üret ve kaydet
@@ -194,10 +222,11 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         num_images=args.num_images,
         seed=args.seed,
+        num_steps=num_steps,
     )
 
     print(f"\n{'='*50}")
     print(f"Üretilen {len(paths)} görüntü:")
     for p in paths:
-        print(f"  → {p}")
-    print(f"Ayarlar: steps={NUM_INFERENCE_STEPS}, CFG={GUIDANCE_SCALE}, size={IMAGE_SIZE}x{IMAGE_SIZE}")
+        print(f"  -> {p}")
+    print(f"Ayarlar: scheduler={args.scheduler}, steps={num_steps}, CFG={GUIDANCE_SCALE}, size={IMAGE_SIZE}x{IMAGE_SIZE}")
